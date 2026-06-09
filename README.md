@@ -147,4 +147,68 @@ docker compose down
 
 ## Design Decisions
 
-_Design decisions will be documented here as each part of the implementation is completed._
+### Caching Technology
+
+The core requirement is storing fetched rates temporarily and serving them within a 5-minute validity window to avoid hitting the upstream API on every request. Three options were considered.
+
+---
+
+**Option 1 — In-Memory Store (class variable / Ruby Hash)**
+
+Store cached rates directly in a Ruby class variable inside the Rails app process.
+
+| | |
+|---|---|
+| Dependencies | None |
+| New failure modes | None |
+| Works across Puma workers | ❌ No |
+| Works across multiple servers | ❌ No |
+
+Rejected because each Puma worker process has completely isolated memory. A rate cached by worker 1 is invisible to worker 2 — they would each call the upstream API independently for the same combination, making the cache ineffective and burning through the 1,000 calls/day quota. This approach does not satisfy even single-server correctness.
+
+---
+
+**Option 2 — Redis**
+
+Redis is a dedicated in-memory data store, purpose-built for caching. It stores data entirely in RAM, making reads and writes extremely fast (~0.1ms). It has native TTL support — key expiry is handled automatically with no timestamp logic needed in application code. It is the industry standard for this exact use case.
+
+| | |
+|---|---|
+| Dependencies | New Docker service + `redis` gem |
+| New failure modes | Redis unavailable, Redis out of memory |
+| Works across Puma workers | ✅ Yes |
+| Works across multiple servers | ✅ Yes |
+
+Rejected because it introduces Redis as a new network dependency — a separate process that can go down independently of the Rails app. If Redis becomes unavailable, every incoming request becomes a cache miss and hits the upstream API directly. At 10,000 requests/day, this could exhaust the 1,000 calls/day quota very rapidly. Handling this correctly requires Redis health checks, connection error handling, and a deliberate decision on fail-open vs fail-closed behaviour — all additional complexity that introduces more operational risk than it solves at this scale.
+
+It is also worth noting that adding Redis as a docker-compose container does not actually solve the multi-server problem. When `docker compose up` is run on two separate nodes, each node gets its own isolated Redis container with its own data — the same limitation as SQLite. True distributed correctness requires a single dedicated shared Redis host that all app servers point to, which is a significantly larger infrastructure commitment beyond the scope of this assignment.
+
+---
+
+**Option 3 — SQLite (chosen)**
+
+SQLite is not a separate server process like Redis or PostgreSQL. It is a library embedded directly inside the Rails app that reads and writes a single file on disk. There is no network connection, no separate process, and no connection management — if the Rails app is running, SQLite is available. It is already present and configured in the scaffold with zero additional setup required.
+
+| | |
+|---|---|
+| Dependencies | None — already in scaffold |
+| New failure modes | None |
+| Works across Puma workers | ✅ Yes — all workers share the same file |
+| Works across multiple servers | ❌ No — each server has its own file |
+
+**Why SQLite is sufficient for this assignment:**
+
+The assignment requires handling 10,000+ requests/day. In practice:
+
+| Metric | Value |
+|---|---|
+| Average requests per second | ~0.12 (10,000 ÷ 86,400) |
+| Peak requests per second (assumed 200× average as a conservative worst case) | ~24 |
+| Single server capacity — cache-hit path (assumed: 2 CPU cores, 4GB RAM, Puma 2 workers × 5 threads) | ~500–1,000 req/sec |
+| Headroom above peak | ~20–40× |
+
+SQLite reads from disk and is fast enough for this use case — cache reads are simple single-row lookups on a table with at most 36 rows, and write locks only activate on a cache miss which is a rare event (at most once per combination per 5-minute window). At 24 peak requests/second, both read latency and write contention are negligible. Even at full single-server capacity (500–1,000 req/sec), SQLite handles concurrent reads comfortably since multiple readers never block each other — only writes require a brief lock, and cache misses remain rare regardless of traffic volume.
+
+Redis is faster than SQLite since it stores data entirely in memory. However the actual latency difference depends heavily on deployment topology — whether Redis is on the same machine, a different node, or a managed service on a separate host — and under typical conditions both are in a similar low-millisecond range that makes no noticeable difference to users at this traffic level.
+
+**Known limitation:** if this service were deployed across multiple servers, each server would have its own SQLite file and the cache would not be shared between instances. In that scenario Redis would be the correct replacement. This is a deliberate tradeoff — the FAQ explicitly states *"production-ready does not mean FAANG-scale"* and to *"choose the most straightforward path."* SQLite solves the actual problem correctly without introducing infrastructure that the assignment does not require.
