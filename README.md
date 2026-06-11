@@ -212,3 +212,26 @@ SQLite reads from disk and is fast enough for this use case — cache reads are 
 Redis is faster than SQLite since it stores data entirely in memory. However the actual latency difference depends heavily on deployment topology — whether Redis is on the same machine, a different node, or a managed service on a separate host — and under typical conditions both are in a similar low-millisecond range that makes no noticeable difference to users at this traffic level.
 
 **Known limitation:** if this service were deployed across multiple servers, each server would have its own SQLite file and the cache would not be shared between instances. In that scenario Redis would be the correct replacement. This is a deliberate tradeoff — the FAQ explicitly states *"production-ready does not mean FAANG-scale"* and to *"choose the most straightforward path."* SQLite solves the actual problem correctly without introducing infrastructure that the assignment does not require.
+
+---
+
+### Cache Table Schema
+
+**Separate columns vs single key column**
+
+Two options were considered for storing the cache key:
+
+- **Single key column** — store `"Summer.FloatingPointResort.SingletonRoom"` as one string with a separate `value` column
+- **Separate columns** — store `period`, `hotel`, `room` as individual columns (chosen)
+
+The single key column approach violates **First Normal Form (1NF)** — a fundamental relational database design principle that each column should store one atomic value, not a composite of multiple values squashed into a string. Separate columns keep each field as a distinct meaningful piece of data, making queries explicit and rows human-readable.
+
+**Composite unique index on `(period, hotel, room)`**
+
+A unique index is added across all three columns. This serves two purposes:
+- **Data integrity** — the database enforces that only one cached rate can exist per combination, preventing duplicate rows from concurrent writes
+- **Upsert support** — when refreshing a stale rate, `upsert` uses this unique index to decide whether to insert a new row or update the existing one, in a single atomic operation
+
+**`null: false` on all columns**
+
+Every column is defined with `null: false`, enforcing at the database level that no row can be stored with missing values. This is a last line of defence — even if application-level logic has a bug, the database will reject incomplete data loudly rather than silently storing corrupt rows.
