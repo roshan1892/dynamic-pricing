@@ -235,3 +235,46 @@ A unique index is added across all three columns. This serves two purposes:
 **`null: false` on all columns**
 
 Every column is defined with `null: false`, enforcing at the database level that no row can be stored with missing values. This is a last line of defence — even if application-level logic has a bug, the database will reject incomplete data loudly rather than silently storing corrupt rows.
+
+---
+
+### Cache Stampede Prevention
+
+When a cached rate expires, multiple concurrent requests for the same combination could simultaneously find the cache stale and all call the upstream API — wasting quota and potentially exhausting the 1,000 calls/day limit.
+
+**Within a single Puma process (threads):**
+
+A per-key Mutex with double-checked locking is used:
+
+1. First cache check outside the lock — cache hits require no locking at all, so uncontested requests are never slowed down
+2. If stale, acquire a Mutex specific to that cache key — only threads competing for the same combination block each other, unrelated combinations proceed in parallel
+3. Second cache check inside the lock — a thread that was waiting may find the cache already refreshed by the thread that held the lock, avoiding a redundant upstream call
+4. If still stale after second check — call upstream, store result, return
+
+**Across multiple Puma worker processes:**
+
+A Mutex lives in process memory and is invisible to other processes. Unlike PostgreSQL which supports row-level locking, SQLite only supports table-level locking — meaning a table-level lock held during an upstream HTTP call would block all cache reads across all worker processes for that entire duration. This is too aggressive and would significantly degrade performance.
+
+Given SQLite as the caching solution, the **optimistic approach is the most appropriate choice**. The optimistic approach means no explicit locking is used across processes — each worker proceeds independently, assuming that concurrent access to the same stale entry will be rare. If multiple worker processes simultaneously find a stale entry and all call upstream, `upsert` handles the concurrent writes safely with no data corruption and all processes return a valid fresh rate. The worst case is N extra upstream calls (where N is the number of worker processes) for the same stale combination at the same moment.
+
+In practice this is not a concern for this assignment — Puma is configured with a single worker process by default (`WEB_CONCURRENCY` not set), meaning cross-process stampede cannot occur in our current deployment. The Mutex-based per-key locking fully protects all 5 threads within that single process.
+
+For guaranteed cross-process stampede prevention, the solution would need to move away from SQLite — `PostgreSQL SELECT FOR UPDATE` provides row-level locking that works correctly across processes without blocking unrelated reads, or Redis Redlock provides a distributed lock mechanism. Both are valid production solutions but require infrastructure changes beyond the scope of this assignment.
+
+---
+
+### Puma Worker Process Configuration
+
+A single Puma worker process with 5 threads is used for this assignment. Multiple worker processes were not configured because a single process is more than sufficient for the stated requirement of 10,000 requests/day (0.12 req/sec average, ~24 req/sec at conservative peak). Adding worker processes would increase memory usage and complexity without providing any capacity benefit at this traffic level.
+
+Estimated capacity of a single worker with 5 threads:
+
+| Path | Estimated Max QPS |
+|---|---|
+| Cache hit (SQLite read + JSON response) | ~100–200 req/sec |
+| Mixed (mostly cache hits, occasional miss) | ~80–150 req/sec |
+| Pure cache misses (upstream API dominates) | ~10–25 req/sec |
+
+Note: these are informed estimates based on typical Rails/Puma behaviour with SQLite — exact numbers would require a load test. At ~24 req/sec peak, our setup has comfortable headroom even under the most conservative estimate.
+
+If traffic requirements grew significantly, `WEB_CONCURRENCY` could be set to match the number of CPU cores to achieve true parallelism. At that point the cross-process stampede consideration described above would become relevant and the appropriate locking strategy would need to be revisited.
