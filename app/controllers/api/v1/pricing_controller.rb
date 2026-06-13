@@ -3,7 +3,7 @@ class Api::V1::PricingController < ApplicationController
   VALID_HOTELS = %w[FloatingPointResort GitawayHotel RecursionRetreat].freeze
   VALID_ROOMS = %w[SingletonRoom BooleanTwin RestfulKing].freeze
 
-  before_action :validate_params
+  before_action :set_request_id, :validate_params
 
   def index
     period = params[:period]
@@ -18,11 +18,15 @@ class Api::V1::PricingController < ApplicationController
       render json: service.errors.first, status: :service_unavailable
     end
   rescue StandardError => e
-    Rails.logger.error({ event: 'unexpected_error', message: e.message, backtrace: e.backtrace&.first }.to_json)
+    Rails.logger.error({ timestamp: Time.current.utc.iso8601(3), request_id: Thread.current[:request_id], event: 'unexpected_error', message: e.message, backtrace: e.backtrace&.first }.to_json)
     render json: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred. Please try again.' }, status: :internal_server_error
   end
 
   private
+
+  def set_request_id
+    Thread.current[:request_id] = request.request_id
+  end
 
   def validate_params
     unless params[:period].present? && params[:hotel].present? && params[:room].present?

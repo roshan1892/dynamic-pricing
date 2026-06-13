@@ -16,7 +16,8 @@ module Api::V1
 
       LOCKS[cache_key].synchronize do
         # Second check inside the lock — another thread may have refreshed
-        # the cache while we were waiting to acquire the Mutex
+        # the cache while we were waiting to acquire the Mutex.
+        # If found here, still a cache_hit — no upstream call was made.
         return if load_from_cache
 
         fetch_rate_and_cache
@@ -27,7 +28,11 @@ module Api::V1
 
     def load_from_cache
       cached = CachedRate.fetch_fresh(period: @period, hotel: @hotel, room: @room)
-      @result = cached.rate if cached
+      if cached
+        @result = cached.rate
+        log_event(:info, event: 'cache_hit')
+      end
+      cached
     end
 
     def cache_key
@@ -35,18 +40,39 @@ module Api::V1
     end
 
     def fetch_rate_and_cache
+      log_event(:info, event: 'cache_miss')
+      start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       response = RateApiClient.get_rate(period: @period, hotel: @hotel, room: @room)
+      log_event(:info, event: 'upstream_api_call', duration_ms: elapsed_ms(start_time))
+      handle_response(response)
+    rescue RateApiClient::TimeoutError
+      log_event(:error, event: 'upstream_timeout')
+      errors << { code: 'UPSTREAM_TIMEOUT', message: 'The upstream pricing API did not respond in time. Please try again.' }
+    rescue RateApiClient::ConnectionError
+      log_event(:error, event: 'upstream_connection_error')
+      errors << { code: 'UPSTREAM_TIMEOUT', message: 'The upstream pricing API is unreachable. Please try again.' }
+    rescue JSON::ParserError
+      log_event(:error, event: 'upstream_parse_error', body: response.body.to_s)
+      errors << { code: 'UPSTREAM_ERROR', message: 'The upstream pricing API returned an unreadable response.' }
+    end
 
+    def handle_response(response)
       # API docs only document happy path — error format is unknown and unstable.
       # Log raw response for debugging, return our own structured error to the client.
       if response.code == 429
-        Rails.logger.warn({ event: 'upstream_rate_limit', body: response.body.to_s }.to_json)
+        log_event(:warn, event: 'upstream_rate_limit', body: response.body.to_s)
         errors << { code: 'RATE_LIMIT_EXCEEDED', message: 'The upstream pricing API daily quota has been exhausted. Please try again later.' }
         return
       end
 
       unless response.success?
-        Rails.logger.error({ event: 'upstream_error', http_code: response.code, body: response.body.to_s }.to_json)
+        level = response.code >= 500 ? :error : :warn
+        event = case response.code
+                when 300..399 then 'upstream_redirect_error'
+                when 400..499 then 'upstream_client_error'
+                else               'upstream_server_error'
+                end
+        log_event(level, event: event, http_code: response.code, body: response.body.to_s)
         errors << { code: 'UPSTREAM_ERROR', message: "The upstream pricing API returned an unexpected error (HTTP #{response.code})." }
         return
       end
@@ -54,14 +80,10 @@ module Api::V1
       rate = parse_rate(response.body)
       return unless errors.empty?
 
+      store_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       CachedRate.store(period: @period, hotel: @hotel, room: @room, rate: rate)
+      log_event(:info, event: 'cache_store', duration_ms: elapsed_ms(store_start))
       @result = rate
-    rescue RateApiClient::TimeoutError
-      errors << { code: 'UPSTREAM_TIMEOUT', message: 'The upstream pricing API did not respond in time. Please try again.' }
-    rescue RateApiClient::ConnectionError
-      errors << { code: 'UPSTREAM_TIMEOUT', message: 'The upstream pricing API is unreachable. Please try again.' }
-    rescue JSON::ParserError
-      errors << { code: 'UPSTREAM_ERROR', message: 'The upstream pricing API returned an unreadable response.' }
     end
 
     def parse_rate(body)
@@ -73,10 +95,23 @@ module Api::V1
                &.dig('rate')
 
       unless rate
+        log_event(:warn, event: 'rate_not_found', body: body)
         errors << { code: 'RATE_NOT_FOUND', message: 'No rate was returned for the requested combination.' }
       end
 
       rate
+    end
+
+    def log_event(level, **fields)
+      Rails.logger.public_send(level, log_context.merge(fields).to_json)
+    end
+
+    def log_context
+      { timestamp: Time.current.utc.iso8601(3), request_id: Thread.current[:request_id], period: @period, hotel: @hotel, room: @room }
+    end
+
+    def elapsed_ms(start_time)
+      ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time) * 1000).round
     end
   end
 end

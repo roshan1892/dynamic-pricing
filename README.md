@@ -66,8 +66,10 @@ Option 1 — per-combination on-demand cache. It is the simplest approach, only 
 |---|---|---|---|
 | Missing or invalid parameters | 400 | `INVALID_PARAMETERS` | Validated before hitting cache or upstream |
 | Network timeout to upstream API | 503 | `UPSTREAM_TIMEOUT` | Return descriptive error |
+| Upstream API unreachable | 503 | `UPSTREAM_TIMEOUT` | Return descriptive error |
 | Rate limit exhausted (assumed HTTP 429 — not explicitly documented in API spec) | 503 | `RATE_LIMIT_EXCEEDED` | Return descriptive error |
-| HTTP 5xx — upstream API error | 503 | `UPSTREAM_ERROR` | Return descriptive error |
+| Upstream API returned non-2xx response (3xx, 4xx, 5xx) | 503 | `UPSTREAM_ERROR` | Return descriptive error — logged with specific event per status range for internal observability |
+| Unreadable response (not valid JSON) | 503 | `UPSTREAM_ERROR` | Return descriptive error |
 | Rate missing in successful response | 503 | `RATE_NOT_FOUND` | Defensive — not a documented API behaviour, but the existing code uses a safe navigation operator (`&.dig`) suggesting the original author anticipated this case |
 | Concurrent requests for same stale key | — | — | Only one upstream call fires — cache stampede prevention |
 | Unexpected internal error (bug, SQLite failure, etc.) | 500 | `INTERNAL_ERROR` | Caught by controller safety net — always returns JSON, never an HTML error page |
@@ -104,10 +106,55 @@ Note: upstream failures return **503 (Service Unavailable)** rather than 500 —
 { "code": "INVALID_PARAMETERS", "message": "Invalid period. Must be one of: Summer, Autumn, Winter, Spring" }
 { "code": "RATE_LIMIT_EXCEEDED", "message": "The upstream pricing API daily quota has been exhausted. Please try again later." }
 { "code": "UPSTREAM_TIMEOUT",    "message": "The upstream pricing API did not respond in time. Please try again." }
-{ "code": "UPSTREAM_ERROR",      "message": "The upstream pricing API returned an unexpected error." }
+{ "code": "UPSTREAM_ERROR",      "message": "The upstream pricing API returned an unexpected error (HTTP 500)." }
 { "code": "RATE_NOT_FOUND",      "message": "No rate was returned for the requested combination." }
 { "code": "INTERNAL_ERROR",     "message": "An unexpected error occurred. Please try again." }
 ```
+
+## Observability
+
+Every request emits structured JSON log events, making it easy to monitor behaviour, diagnose issues, and derive metrics in a log aggregation tool (e.g. Datadog, ELK, CloudWatch).
+
+Each log entry includes `timestamp` (ISO 8601), `request_id` (from Rails' `X-Request-Id` header — auto-generated if not provided by the client), `period`, `hotel`, and `room` for full request context. This allows all log lines for a single request to be correlated by `request_id`.
+
+### Log Events
+
+| Event | Level | Fields | When |
+|---|---|---|---|
+| `cache_hit` | info | `request_id`, `period`, `hotel`, `room` | Fresh rate served from cache — no upstream call |
+| `cache_miss` | info | `request_id`, `period`, `hotel`, `room` | Cache empty or stale — upstream call will follow |
+| `upstream_api_call` | info | + `duration_ms` | Every upstream API call with response time |
+| `cache_store` | info | + `duration_ms` | Rate successfully stored in cache — `duration_ms` is SQLite write time |
+| `upstream_rate_limit` | warn | + `body` | HTTP 429 received — daily quota exhausted |
+| `upstream_redirect_error` | warn | + `http_code`, `body` | HTTP 3xx received — unexpected redirect, likely a configuration issue |
+| `upstream_client_error` | warn | + `http_code`, `body` | HTTP 4xx received — our request was rejected, API contract may have changed |
+| `upstream_server_error` | error | + `http_code`, `body` | HTTP 5xx received — upstream service is having problems |
+| `upstream_timeout` | error | `request_id`, `period`, `hotel`, `room` | Request timed out |
+| `upstream_connection_error` | error | `request_id`, `period`, `hotel`, `room` | Upstream API unreachable |
+| `upstream_parse_error` | error | `request_id`, `period`, `hotel`, `room` | Unreadable response from upstream |
+| `rate_not_found` | warn | `request_id`, `period`, `hotel`, `room` | Successful response but rate missing for requested combination |
+| `unexpected_error` | error | `message`, `backtrace` | Unhandled exception caught by controller safety net |
+
+### Example Log Lines
+
+```json
+{"timestamp":"2026-06-13T09:21:15.123Z","request_id":"abc-123","period":"Summer","hotel":"FloatingPointResort","room":"SingletonRoom","event":"cache_miss"}
+{"timestamp":"2026-06-13T09:21:15.245Z","request_id":"abc-123","period":"Summer","hotel":"FloatingPointResort","room":"SingletonRoom","event":"upstream_api_call","duration_ms":245}
+{"timestamp":"2026-06-13T09:21:15.490Z","request_id":"abc-123","period":"Summer","hotel":"FloatingPointResort","room":"SingletonRoom","event":"cache_store","duration_ms":2}
+{"timestamp":"2026-06-13T09:21:16.001Z","request_id":"xyz-456","period":"Summer","hotel":"FloatingPointResort","room":"SingletonRoom","event":"cache_hit"}
+```
+
+### Deriving Metrics from Logs
+
+Since logs are structured JSON, a log aggregation tool can derive metrics without any additional instrumentation:
+- **Cache hit rate** — count of `cache_hit` ÷ total requests
+- **Upstream API latency** — average `duration_ms` from `upstream_api_call` events
+- **Error rate** — count of `upstream_error` + `upstream_timeout` + `upstream_connection_error` events
+- **Quota consumption** — count of `upstream_api_call` events per day
+
+### Note on Traces
+
+Distributed tracing (e.g. OpenTelemetry) is not implemented — the `request_id` in every log line provides basic request correlation sufficient for this single-service deployment. Full distributed tracing would be the next step if this service communicated with other downstream services.
 
 ## Setup & Running
 
