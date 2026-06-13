@@ -70,6 +70,7 @@ Option 1 — per-combination on-demand cache. It is the simplest approach, only 
 | HTTP 5xx — upstream API error | 503 | `UPSTREAM_ERROR` | Return descriptive error |
 | Rate missing in successful response | 503 | `RATE_NOT_FOUND` | Defensive — not a documented API behaviour, but the existing code uses a safe navigation operator (`&.dig`) suggesting the original author anticipated this case |
 | Concurrent requests for same stale key | — | — | Only one upstream call fires — cache stampede prevention |
+| Unexpected internal error (bug, SQLite failure, etc.) | 500 | `INTERNAL_ERROR` | Caught by controller safety net — always returns JSON, never an HTML error page |
 
 Note: upstream failures return **503 (Service Unavailable)** rather than 500 — the problem is with the external dependency, not our service itself.
 
@@ -105,6 +106,7 @@ Note: upstream failures return **503 (Service Unavailable)** rather than 500 —
 { "code": "UPSTREAM_TIMEOUT",    "message": "The upstream pricing API did not respond in time. Please try again." }
 { "code": "UPSTREAM_ERROR",      "message": "The upstream pricing API returned an unexpected error." }
 { "code": "RATE_NOT_FOUND",      "message": "No rate was returned for the requested combination." }
+{ "code": "INTERNAL_ERROR",     "message": "An unexpected error occurred. Please try again." }
 ```
 
 ## Setup & Running
@@ -212,6 +214,14 @@ SQLite reads from disk and is fast enough for this use case — cache reads are 
 Redis is faster than SQLite since it stores data entirely in memory. However the actual latency difference depends heavily on deployment topology — whether Redis is on the same machine, a different node, or a managed service on a separate host — and under typical conditions both are in a similar low-millisecond range that makes no noticeable difference to users at this traffic level.
 
 **Known limitation:** if this service were deployed across multiple servers, each server would have its own SQLite file and the cache would not be shared between instances. In that scenario Redis would be the correct replacement. This is a deliberate tradeoff — the FAQ explicitly states *"production-ready does not mean FAANG-scale"* and to *"choose the most straightforward path."* SQLite solves the actual problem correctly without introducing infrastructure that the assignment does not require.
+
+---
+
+### Upstream Error Response Handling
+
+The upstream API documentation only specifies the happy path response format. Error response format, structure, and HTTP status codes are undocumented. Because of this we return our own structured `{ code, message }` error to the client rather than passing through the upstream response — whose format and stability we cannot rely on.
+
+If the upstream API were to document a structured error format in the future, surfacing the upstream error message alongside our own would improve troubleshooting for clients. For now, the raw upstream response body is logged internally so that it is available for debugging without exposing it to clients.
 
 ---
 

@@ -17,6 +17,9 @@ class Api::V1::PricingController < ApplicationController
     else
       render json: service.errors.first, status: :service_unavailable
     end
+  rescue StandardError => e
+    Rails.logger.error({ event: 'unexpected_error', message: e.message, backtrace: e.backtrace&.first }.to_json)
+    render json: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred. Please try again.' }, status: :internal_server_error
   end
 
   private
