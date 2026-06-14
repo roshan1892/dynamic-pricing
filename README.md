@@ -53,28 +53,70 @@ Rejected because: fetches data for all 36 combinations even when only 1 or 2 are
 A scheduled job proactively refreshes all combinations before they expire, so users always read from a warm cache.
 Rejected because: always fetches all 36 regardless of demand, requires a job scheduler and failure handling, and adds significant complexity beyond what the assignment requires.
 
-
 ### Final Decision
 
 Option 1 — per-combination on-demand cache. It is the simplest approach, only calls upstream for combinations that are actually requested, and works correctly under realistic traffic where a few popular combinations account for most requests.
 
 **Known tradeoff:** in the theoretical worst case where all 36 combinations are requested continuously across every 5-minute window, upstream calls could reach 36 × 12 × 24 = **10,368/day** — exceeding the 1,000 limit. If this limit is hit, the upstream API returns HTTP 429. Our service handles this gracefully by returning a clear descriptive error to the user. If worst-case correctness became a hard requirement, switching to Option 2 (batching all 36 in a single upstream request) would cap calls at 288/day. Option 3 (background job) could also achieve this but only if it uses batching internally — otherwise it faces the same worst-case problem.
 
-## Failure Modes Identified
+## Setup & Running
 
-| Failure | Our Service Returns | Error Code | Handling |
-|---|---|---|---|
-| Missing or invalid parameters | 400 | `INVALID_PARAMETERS` | Validated before hitting cache or upstream |
-| Network timeout to upstream API | 503 | `UPSTREAM_TIMEOUT` | Return descriptive error |
-| Upstream API unreachable | 503 | `UPSTREAM_TIMEOUT` | Return descriptive error |
-| Rate limit exhausted (assumed HTTP 429 — not explicitly documented in API spec) | 503 | `RATE_LIMIT_EXCEEDED` | Return descriptive error |
-| Upstream API returned non-2xx response (3xx, 4xx, 5xx) | 503 | `UPSTREAM_ERROR` | Return descriptive error — logged with specific event per status range for internal observability |
-| Unreadable response (not valid JSON) | 503 | `UPSTREAM_ERROR` | Return descriptive error |
-| Rate missing in successful response | 503 | `RATE_NOT_FOUND` | Defensive — not a documented API behaviour, but the existing code uses a safe navigation operator (`&.dig`) suggesting the original author anticipated this case |
-| Concurrent requests for same stale key | — | — | Only one upstream call fires — cache stampede prevention |
-| Unexpected internal error (bug, SQLite failure, etc.) | 500 | `INTERNAL_ERROR` | Caught by controller safety net — always returns JSON, never an HTML error page |
+### Prerequisites
 
-Note: upstream failures return **503 (Service Unavailable)** rather than 500 — the problem is with the external dependency, not our service itself.
+- **Docker** — any recent version with Docker Compose V2 support (commands use `docker compose`, not `docker-compose`)
+- **Docker Desktop** — recommended for Mac/Windows as it includes both Docker and Docker Compose
+
+No local Ruby installation is required. The Dockerfile installs Ruby 3.2.6 and all gem dependencies inside the container automatically when you run `docker compose up --build`.
+
+### Start the service
+
+```bash
+docker compose up -d --build
+```
+
+This starts two containers:
+- `interview-dev` — the Rails proxy service on port 3000
+- `rate-api` — the upstream pricing model on port 8080
+
+### Test the endpoint
+
+```bash
+curl 'http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort&room=SingletonRoom'
+```
+
+### Run the test suite
+
+```bash
+# Full suite
+docker compose exec interview-dev ./bin/rails test
+
+# Specific file
+docker compose exec interview-dev ./bin/rails test test/controllers/pricing_controller_test.rb
+```
+
+### Test coverage report
+
+After running the test suite, an HTML coverage report is generated at `coverage/index.html` inside the container. To view it locally:
+
+```bash
+docker compose exec interview-dev cat coverage/index.html > /tmp/coverage.html && open /tmp/coverage.html
+```
+
+Current coverage: **100%** across all application code (unused Rails boilerplate — `app/channels/`, `app/jobs/` — excluded from measurement as they are auto-generated and not part of this application).
+
+### Reset the upstream API quota (development only)
+
+The upstream rate API enforces a hard limit of 1,000 calls per day. During development, if you exhaust the quota, simply restart the rate-api container to reset it:
+
+```bash
+docker compose restart rate-api
+```
+
+### Stop the service
+
+```bash
+docker compose down
+```
 
 ## API
 
@@ -93,6 +135,8 @@ Note: upstream failures return **503 (Service Unavailable)** rather than 500 —
 { "rate": "12000" }
 ```
 
+Note: `rate` is returned as a string (e.g. `"12000"`) — this matches the upstream API's response format exactly. No conversion is applied.
+
 **Error response structure:**
 ```json
 {
@@ -110,6 +154,22 @@ Note: upstream failures return **503 (Service Unavailable)** rather than 500 —
 { "code": "RATE_NOT_FOUND",      "message": "No rate was returned for the requested combination." }
 { "code": "INTERNAL_ERROR",     "message": "An unexpected error occurred. Please try again." }
 ```
+
+## Failure Modes Identified
+
+| Failure | Our Service Returns | Error Code | Handling |
+|---|---|---|---|
+| Missing or invalid parameters | 400 | `INVALID_PARAMETERS` | Validated before hitting cache or upstream |
+| Network timeout to upstream API | 503 | `UPSTREAM_TIMEOUT` | Return descriptive error |
+| Upstream API unreachable | 503 | `UPSTREAM_TIMEOUT` | Return descriptive error |
+| Rate limit exhausted (assumed HTTP 429 — not explicitly documented in API spec) | 503 | `RATE_LIMIT_EXCEEDED` | Return descriptive error |
+| Upstream API returned non-2xx response (3xx, 4xx, 5xx) | 503 | `UPSTREAM_ERROR` | Return descriptive error — logged with specific event per status range for internal observability |
+| Unreadable response (not valid JSON) | 503 | `UPSTREAM_ERROR` | Return descriptive error |
+| Rate missing in successful response | 503 | `RATE_NOT_FOUND` | Defensive — not a documented API behaviour, but the existing code uses a safe navigation operator (`&.dig`) suggesting the original author anticipated this case |
+| Concurrent requests for same stale key | — | — | Only one upstream call fires — cache stampede prevention |
+| Unexpected internal error (bug, SQLite failure, etc.) | 500 | `INTERNAL_ERROR` | Caught by controller safety net — always returns JSON, never an HTML error page |
+
+Note: upstream failures return **503 (Service Unavailable)** rather than 500 — the problem is with the external dependency, not our service itself.
 
 ## Observability
 
@@ -158,22 +218,6 @@ Distributed tracing (e.g. OpenTelemetry) is not implemented — the `request_id`
 
 ## Testing
 
-### Test Coverage
-
-SimpleCov is used for coverage reporting. Run the test suite and coverage is automatically reported:
-
-```bash
-docker compose exec interview-dev ./bin/rails test
-```
-
-After running the tests, an HTML coverage report is generated at `coverage/index.html` inside the container. To view it locally:
-
-```bash
-docker compose exec interview-dev cat coverage/index.html > /tmp/coverage.html && open /tmp/coverage.html
-```
-
-Current coverage: **100%** across all application code (unused Rails boilerplate — `app/channels/`, `app/jobs/` — excluded from measurement as they are auto-generated and not part of this application).
-
 ### Test Strategy
 
 **Integration tests (`test/controllers/pricing_controller_test.rb`)** — 20 tests covering the full request stack from HTTP request to response. These test all meaningful behaviours: cache hits, cache misses, TTL boundaries, all error cases, and edge cases identified during implementation.
@@ -220,43 +264,21 @@ Current coverage: **100%** across all application code (unused Rails boilerplate
 | 27 | `Net::OpenTimeout` wrapped as `TimeoutError` | Unit | Transport exception translated to domain exception |
 | 28 | `SocketError` wrapped as `ConnectionError` | Unit | Transport exception translated to domain exception |
 
-## Setup & Running
+## AI Tool Usage
 
-### Prerequisites
+This solution was developed with assistance from **Claude** (Anthropic).
 
-- Docker and Docker Compose
+**Workflow:** Claude was used as an AI assistant to discuss design decisions, explore tradeoffs, and validate technical approaches throughout the assignment. Options were considered, assumptions were challenged, and reasoning was understood before any implementation decisions were made.
 
-### Start the service
+**Parts developed with AI assistance:**
+- Design decision analysis and tradeoff evaluation (caching technology, schema design, concurrency strategy, error handling architecture)
+- Structured logging design
+- Test strategy and test case identification
+- README documentation
 
-```bash
-docker compose up -d --build
-```
+The design decisions, reasoning, and tradeoffs documented in this README reflect genuine understanding developed through the discussion process — not generated boilerplate.
 
-This starts two containers:
-- `interview-dev` — the Rails proxy service on port 3000
-- `rate-api` — the upstream pricing model on port 8080
-
-### Test the endpoint
-
-```bash
-curl 'http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort&room=SingletonRoom'
-```
-
-### Run the test suite
-
-```bash
-# Full suite
-docker compose exec interview-dev ./bin/rails test
-
-# Specific file
-docker compose exec interview-dev ./bin/rails test test/controllers/pricing_controller_test.rb
-```
-
-### Stop the service
-
-```bash
-docker compose down
-```
+---
 
 ## Design Decisions
 
@@ -317,14 +339,33 @@ The assignment requires handling 10,000+ requests/day. In practice:
 |---|---|
 | Average requests per second | ~0.12 (10,000 ÷ 86,400) |
 | Peak requests per second (assumed 200× average as a conservative worst case) | ~24 |
-| Single server capacity — cache-hit path (assumed: 2 CPU cores, 4GB RAM, Puma 2 workers × 5 threads) | ~500–1,000 req/sec |
-| Headroom above peak | ~20–40× |
+| Single server capacity — cache-hit path (assumed: 2 CPU cores, 4GB RAM, Puma 1 worker × 5 threads) | ~100–200 req/sec |
+| Headroom above peak | ~4–8× |
 
-SQLite reads from disk and is fast enough for this use case — cache reads are simple single-row lookups on a table with at most 36 rows, and write locks only activate on a cache miss which is a rare event (at most once per combination per 5-minute window). At 24 peak requests/second, both read latency and write contention are negligible. Even at full single-server capacity (500–1,000 req/sec), SQLite handles concurrent reads comfortably since multiple readers never block each other — only writes require a brief lock, and cache misses remain rare regardless of traffic volume.
+SQLite reads from disk and is fast enough for this use case — cache reads are simple single-row lookups on a table with at most 36 rows, and write locks only activate on a cache miss which is a rare event (at most once per combination per 5-minute window). At 24 peak requests/second, both read latency and write contention are negligible. Even at full single-server capacity (~100–200 req/sec), SQLite handles concurrent reads comfortably since multiple readers never block each other — only writes require a brief lock, and cache misses remain rare regardless of traffic volume.
 
 Redis is faster than SQLite since it stores data entirely in memory. However the actual latency difference depends heavily on deployment topology — whether Redis is on the same machine, a different node, or a managed service on a separate host — and under typical conditions both are in a similar low-millisecond range that makes no noticeable difference to users at this traffic level.
 
-**Known limitation:** if this service were deployed across multiple servers, each server would have its own SQLite file and the cache would not be shared between instances. In that scenario Redis would be the correct replacement. This is a deliberate tradeoff — the FAQ explicitly states *"production-ready does not mean FAANG-scale"* and to *"choose the most straightforward path."* SQLite solves the actual problem correctly without introducing infrastructure that the assignment does not require.
+**Known limitation:** if this service were deployed across multiple servers, each server would have its own SQLite file and the cache would not be shared between instances. This is a deliberate tradeoff — the FAQ explicitly states *"production-ready does not mean FAANG-scale"* and to *"choose the most straightforward path."* SQLite solves the actual problem correctly without introducing infrastructure that the assignment does not require.
+
+**Scaling to multiple servers — the correct architecture:**
+
+For a multi-server deployment, the cache store must be a single shared service that all app servers connect to — not a container bundled inside each server's `docker-compose.yml`. Adding Redis or PostgreSQL to `docker-compose.yml` would start a separate instance on every server, giving each server its own isolated cache — the same problem as SQLite.
+
+The correct approach is to host the shared store as a dedicated external service:
+
+```
+Load Balancer
+├── App Server 1 (Rails + Puma) ──┐
+├── App Server 2 (Rails + Puma) ──┼──→ Shared Redis or PostgreSQL (dedicated host)
+└── App Server 3 (Rails + Puma) ──┘
+```
+
+Each app server would be configured with an environment variable pointing to the shared host:
+- `REDIS_URL=redis://shared-redis-host:6379` for Redis
+- `DATABASE_URL=postgres://shared-pg-host/pricing` for PostgreSQL
+
+This keeps the app container stateless — it contains only the Rails application code, while all shared state lives in the dedicated external service. This is the standard production pattern for horizontally scaled web services.
 
 ---
 
@@ -399,3 +440,23 @@ Estimated capacity of a single worker with 5 threads:
 Note: these are informed estimates based on typical Rails/Puma behaviour with SQLite — exact numbers would require a load test. At ~24 req/sec peak, our setup has comfortable headroom even under the most conservative estimate.
 
 If traffic requirements grew significantly, `WEB_CONCURRENCY` could be set to match the number of CPU cores to achieve true parallelism. At that point the cross-process stampede consideration described above would become relevant and the appropriate locking strategy would need to be revisited.
+
+---
+
+### Error Handling Architecture
+
+**Why transport exceptions are caught in `RateApiClient`, not `PricingService`**
+
+`RateApiClient` has one responsibility — make HTTP calls to the upstream API. Everything about that HTTP call, including what can go wrong at the transport level (`Net::OpenTimeout`, `SocketError`, `Errno::ECONNREFUSED`), belongs there. `PricingService` is concerned with business logic — checking the cache, fetching rates, storing results. It should not need to know that the rate comes from HTTP or what low-level transport exceptions HTTP can throw. Keeping these concerns separate makes each class easier to test, reason about, and change independently.
+
+**Why `open_timeout 5` and `read_timeout 15` rather than a single timeout**
+
+These are two distinct failure scenarios:
+- `open_timeout` — how long to wait to establish a connection. If we cannot connect within 5 seconds the server is likely down or unreachable — failing fast is correct.
+- `read_timeout` — how long to wait for a response after connecting. The upstream API is described as "computationally expensive" — it may take longer to process the request. 15 seconds allows reasonable time for the model to run without blocking a Puma thread indefinitely.
+
+Setting both separately rather than a single `default_timeout` communicates the intent clearly and is more precise about the failure being handled.
+
+**Why upstream failures return HTTP 503 (Service Unavailable) rather than 500 (Internal Server Error)**
+
+503 means "this service is temporarily unavailable" — the problem is with an external dependency, not our service itself. 500 means "our service crashed" — which is inaccurate when the issue is the upstream API being down or rate-limited. This distinction matters for clients and monitoring tools: a 503 signals "retry later", a 500 signals "there is a bug to investigate". The controller's `rescue StandardError` safety net uses 500 — correctly, because an unhandled exception in our own code IS an internal error.
