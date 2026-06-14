@@ -92,10 +92,12 @@ GEM
     debug (1.11.0)
       irb (~> 1.10)
       reline (>= 0.3.8)
+    docile (1.4.1)
     drb (2.2.3)
     erb (5.0.2)
     erubi (1.13.1)
     ffi (1.17.2-aarch64-linux-musl)
+    ffi (1.17.2-arm64-darwin)
     ffi (1.17.2-x86_64-darwin)
     ffi (1.17.2-x86_64-linux-musl)
     globalid (1.2.1)
@@ -141,6 +143,8 @@ GEM
       net-protocol
     nio4r (2.7.4)
     nokogiri (1.18.9-aarch64-linux-musl)
+      racc (~> 1.4)
+    nokogiri (1.18.9-arm64-darwin)
       racc (~> 1.4)
     nokogiri (1.18.9-x86_64-darwin)
       racc (~> 1.4)
@@ -202,7 +206,14 @@ GEM
     reline (0.6.2)
       io-console (~> 0.5)
     securerandom (0.4.1)
+    simplecov (0.22.0)
+      docile (~> 1.1)
+      simplecov-html (~> 0.11)
+      simplecov_json_formatter (~> 0.1)
+    simplecov-html (0.13.2)
+    simplecov_json_formatter (0.1.4)
     sqlite3 (2.7.3-aarch64-linux-musl)
+    sqlite3 (2.7.3-arm64-darwin)
     sqlite3 (2.7.3-x86_64-darwin)
     sqlite3 (2.7.3-x86_64-linux-musl)
     stringio (3.1.7)
@@ -218,6 +229,7 @@ GEM
 
 PLATFORMS
   aarch64-linux-musl
+  arm64-darwin-24
   x86_64-darwin-24
   x86_64-linux-musl
 
@@ -228,6 +240,7 @@ DEPENDENCIES
   listen (~> 3.3)
   puma (>= 5.0)
   rails (~> 7.1.5, >= 7.1.5.2)
+  simplecov
   sqlite3 (>= 1.4)
   tzinfo-data
 

@@ -34,3 +34,6 @@
 
 # Ignore IDE files.
 /.idea
+
+# Ignore test coverage reports.
+/coverage

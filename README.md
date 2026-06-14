@@ -156,6 +156,70 @@ Since logs are structured JSON, a log aggregation tool can derive metrics withou
 
 Distributed tracing (e.g. OpenTelemetry) is not implemented — the `request_id` in every log line provides basic request correlation sufficient for this single-service deployment. Full distributed tracing would be the next step if this service communicated with other downstream services.
 
+## Testing
+
+### Test Coverage
+
+SimpleCov is used for coverage reporting. Run the test suite and coverage is automatically reported:
+
+```bash
+docker compose exec interview-dev ./bin/rails test
+```
+
+After running the tests, an HTML coverage report is generated at `coverage/index.html` inside the container. To view it locally:
+
+```bash
+docker compose exec interview-dev cat coverage/index.html > /tmp/coverage.html && open /tmp/coverage.html
+```
+
+Current coverage: **100%** across all application code (unused Rails boilerplate — `app/channels/`, `app/jobs/` — excluded from measurement as they are auto-generated and not part of this application).
+
+### Test Strategy
+
+**Integration tests (`test/controllers/pricing_controller_test.rb`)** — 20 tests covering the full request stack from HTTP request to response. These test all meaningful behaviours: cache hits, cache misses, TTL boundaries, all error cases, and edge cases identified during implementation.
+
+**Model unit tests (`test/models/cached_rate_test.rb`)** — 6 tests covering `CachedRate` TTL logic and upsert behaviour in isolation. The model contains the most critical business logic (the 5-minute validity check) so it deserves dedicated unit tests independent of the full stack.
+
+**Client unit tests (`test/lib/rate_api_client_test.rb`)** — 2 tests verifying that transport-level exceptions (`Net::OpenTimeout`, `SocketError`) are correctly translated into domain exceptions (`TimeoutError`, `ConnectionError`). This is `RateApiClient`'s single responsibility and is tested at the right level.
+
+### Why No Separate Service Unit Tests
+
+`PricingService` was considered for dedicated unit tests but integration tests through the controller already exercise every code path in the service — cache hit, cache miss, all error cases. Adding service unit tests would duplicate the same coverage without providing additional confidence. The model and client are the right candidates for isolation testing because they each have a single, independently meaningful responsibility.
+
+### Test Cases
+
+| # | Test | Type | What It Proves |
+|---|---|---|---|
+| 1 | Happy path — returns rate | Integration | Basic flow works end to end |
+| 2 | API fails (500) — returns UPSTREAM_ERROR | Integration | Structured error response on upstream failure |
+| 3 | Missing parameters — returns INVALID_PARAMETERS | Integration | Param validation rejects missing fields |
+| 4 | Empty parameters — returns INVALID_PARAMETERS | Integration | Param validation rejects empty strings |
+| 5 | Invalid period — returns INVALID_PARAMETERS | Integration | Param validation rejects unknown period |
+| 6 | Invalid hotel — returns INVALID_PARAMETERS | Integration | Param validation rejects unknown hotel |
+| 7 | Invalid room — returns INVALID_PARAMETERS | Integration | Param validation rejects unknown room |
+| 8 | Cache hit — API not called | Integration | Core caching — upstream never called when fresh |
+| 9 | Cache miss — API called, result stored | Integration | Cache miss triggers upstream call and stores result |
+| 10 | Stale cache (> 5 min) — API called, cache updated | Integration | Stale entry refreshed with fresh upstream value |
+| 11 | Fresh cache (< 5 min) — API not called | Integration | Fresh entry served without upstream call |
+| 12 | Exactly 5 minutes old — treated as stale | Integration | TTL boundary — 5 min is stale, not fresh |
+| 13 | API returns 429 — returns RATE_LIMIT_EXCEEDED | Integration | Rate limit handled specifically |
+| 14 | API raises TimeoutError — returns UPSTREAM_TIMEOUT | Integration | Timeout handled gracefully |
+| 15 | API raises ConnectionError — returns UPSTREAM_TIMEOUT | Integration | Connection failure handled gracefully |
+| 16 | API returns malformed JSON — returns UPSTREAM_ERROR | Integration | JSON parse error handled gracefully |
+| 17 | Empty rates array — returns RATE_NOT_FOUND | Integration | No matching combination handled gracefully |
+| 17b | Rate field missing in object — returns RATE_NOT_FOUND | Integration | Absent rate field handled via `&.dig` |
+| 24 | Unexpected exception — returns INTERNAL_ERROR | Integration | Controller safety net always returns JSON |
+| 25 | API returns 3xx — returns UPSTREAM_ERROR | Integration | Redirect response handled gracefully |
+| 26 | 4xx non-429 — returns UPSTREAM_ERROR | Integration | Client error response handled gracefully |
+| 18 | `fetch_fresh` returns nil — no entry | Unit | Model handles empty cache |
+| 19 | `fetch_fresh` returns nil — stale entry | Unit | TTL logic correct for stale entries |
+| 20 | `fetch_fresh` returns entry — fresh | Unit | TTL logic correct for fresh entries |
+| 21 | `fetch_fresh` returns nil — exactly 5 min | Unit | TTL boundary condition |
+| 22 | `store` creates new entry | Unit | Upsert creates correctly |
+| 23 | `store` updates existing entry | Unit | Upsert updates without duplicate |
+| 27 | `Net::OpenTimeout` wrapped as `TimeoutError` | Unit | Transport exception translated to domain exception |
+| 28 | `SocketError` wrapped as `ConnectionError` | Unit | Transport exception translated to domain exception |
+
 ## Setup & Running
 
 ### Prerequisites
