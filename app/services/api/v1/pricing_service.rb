@@ -1,5 +1,7 @@
 module Api::V1
   class PricingService < BaseService
+    include StructuredLogging
+
     # One Mutex per unique cache key — only threads competing for the same
     # combination block each other. Unrelated combinations proceed in parallel.
     LOCKS = Hash.new { |h, k| h[k] = Mutex.new }
@@ -80,9 +82,7 @@ module Api::V1
       rate = parse_rate(response.body)
       return unless errors.empty?
 
-      store_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       CachedRate.store(period: @period, hotel: @hotel, room: @room, rate: rate)
-      log_event(:info, event: 'cache_store', duration_ms: elapsed_ms(store_start))
       @result = rate
     end
 
@@ -102,16 +102,8 @@ module Api::V1
       rate
     end
 
-    def log_event(level, **fields)
-      Rails.logger.public_send(level, log_context.merge(fields).to_json)
-    end
-
     def log_context
-      { timestamp: Time.current.utc.iso8601(3), request_id: Thread.current[:request_id], period: @period, hotel: @hotel, room: @room }
-    end
-
-    def elapsed_ms(start_time)
-      ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time) * 1000).round
+      { period: @period, hotel: @hotel, room: @room }
     end
   end
 end

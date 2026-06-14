@@ -47,7 +47,7 @@ Cache each `(period, hotel, room)` combination independently. On a user request,
 
 **Option 2 — Batch all 36 combinations on any cache miss for a request**
 When any combination is stale, fetch all 36 in a single upstream request (the API supports batching natively) and refresh the entire cache at once. This caps worst-case upstream calls at 1 call per 5-minute window × 12 × 24 = **288 calls/day** regardless of traffic distribution.
-Rejected because: fetches data for all 36 combinations even when only 1 or 2 are being requested — unnecessarily refreshing combinations nobody asked for. The batch request also carries significantly higher network bandwidth and takes longer to process than a single combination request, meaning the specific user who triggered the cache miss experiences higher latency waiting for all 36 results. Also adds implementation complexity around parsing and storing batch responses, and handling partial failures within a batch.
+Rejected because: fetches data for all 36 combinations even when only 1 or 2 are being requested — unnecessarily refreshing combinations nobody asked for. The batch request also carries higher network bandwidth than a single combination request (though not dramatically so given only 36 combinations exist), and the specific user who triggered the cache miss experiences higher latency waiting for all 36 results to be processed. Also adds implementation complexity around parsing and storing batch responses, and handling partial failures within a batch.
 
 **Option 3 — Background job refreshing all 36 every 5 minutes**
 A scheduled job proactively refreshes all combinations before they expire, so users always read from a warm cache.
@@ -57,14 +57,19 @@ Rejected because: always fetches all 36 regardless of demand, requires a job sch
 
 Option 1 — per-combination on-demand cache. It is the simplest approach, only calls upstream for combinations that are actually requested, and works correctly under realistic traffic where a few popular combinations account for most requests.
 
-**Known tradeoff:** in the theoretical worst case where all 36 combinations are requested continuously across every 5-minute window, upstream calls could reach 36 × 12 × 24 = **10,368/day** — exceeding the 1,000 limit. If this limit is hit, the upstream API returns HTTP 429. Our service handles this gracefully by returning a clear descriptive error to the user. If worst-case correctness became a hard requirement, switching to Option 2 (batching all 36 in a single upstream request) would cap calls at 288/day. Option 3 (background job) could also achieve this but only if it uses batching internally — otherwise it faces the same worst-case problem.
+**Known tradeoff:** in the theoretical worst case where all 36 combinations are requested continuously across every 5-minute window, upstream calls could reach 36 × 12 × 24 = **10,368/day** — exceeding the 1,000 limit. If this limit is hit, the upstream API returns HTTP 429. Our service handles this gracefully by returning a clear descriptive error to the user.
+
+If worst-case correctness became a hard requirement on a **single server**, either Option 2 (batching all 36 in a single upstream request on demand) or Option 3 (background job with batching internally) would cap calls at 288/day.
+
+However, both options still have limitations in a **multi-instance deployment**. Option 2 — multiple instances could simultaneously find a stale cache and all fire a batch request, multiplying quota usage by the number of instances. Option 3 — each instance would run its own background job, again multiplying calls proportionally.
+
+Solving this correctly at scale requires isolating upstream API calls to a **dedicated single-instance cache refresh service** responsible only for keeping the cache warm, while the dynamic pricing service instances only read from the cache and never call upstream directly. This eliminates quota multiplication regardless of how many pricing service instances are running. However, running that refresh service as a single instance introduces a single point of failure. To make it highly available, multiple instances of the refresh service would need to run — but only one should be active at any given time to avoid quota multiplication. This is solved through **leader election** — a distributed coordination mechanism where instances elect one leader to do the work while others remain on standby. If the leader goes down, a standby takes over automatically. Tools commonly used for this include **Apache Zookeeper**, **etcd**, **Consul**, a **Redis distributed lock**, a **Kubernetes CronJob** (which guarantees single execution), or a managed external scheduler like **AWS EventBridge**. This is how cache refresh infrastructure would be set up at large scale — but it represents significant infrastructure complexity well beyond the scope of this assignment.
 
 ## Setup & Running
 
 ### Prerequisites
 
-- **Docker** — any recent version with Docker Compose V2 support (commands use `docker compose`, not `docker-compose`)
-- **Docker Desktop** — recommended for Mac/Windows as it includes both Docker and Docker Compose
+- **Docker with Compose V2** — commands use `docker compose` (not `docker-compose`). [Docker Desktop](https://www.docker.com/products/docker-desktop/) is the recommended installation for Mac and Windows as it includes both Docker and Compose out of the box.
 
 No local Ruby installation is required. The Dockerfile installs Ruby 3.2.6 and all gem dependencies inside the container automatically when you run `docker compose up --build`.
 
@@ -80,8 +85,19 @@ This starts two containers:
 
 ### Test the endpoint
 
+**Mac/Linux:**
 ```bash
 curl 'http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort&room=SingletonRoom'
+```
+
+**Windows (CMD):**
+```cmd
+curl "http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort&room=SingletonRoom"
+```
+
+**Windows (PowerShell) — use `curl.exe` to invoke the real curl binary, not the PowerShell alias:**
+```powershell
+curl.exe "http://localhost:3000/api/v1/pricing?period=Summer&hotel=FloatingPointResort&room=SingletonRoom"
 ```
 
 ### Run the test suite
@@ -98,8 +114,24 @@ docker compose exec interview-dev ./bin/rails test test/controllers/pricing_cont
 
 After running the test suite, an HTML coverage report is generated at `coverage/index.html` inside the container. To view it locally:
 
+**macOS:**
 ```bash
 docker compose exec interview-dev cat coverage/index.html > /tmp/coverage.html && open /tmp/coverage.html
+```
+
+**Linux:**
+```bash
+docker compose exec interview-dev cat coverage/index.html > /tmp/coverage.html && xdg-open /tmp/coverage.html
+```
+
+**Windows (PowerShell):**
+```powershell
+docker compose exec interview-dev cat coverage/index.html > $env:TEMP\coverage.html; start $env:TEMP\coverage.html
+```
+
+**Windows (Command Prompt):**
+```cmd
+docker compose exec interview-dev cat coverage/index.html > %TEMP%\coverage.html && start %TEMP%\coverage.html
 ```
 
 Current coverage: **100%** across all application code (unused Rails boilerplate — `app/channels/`, `app/jobs/` — excluded from measurement as they are auto-generated and not part of this application).
@@ -181,8 +213,8 @@ Each log entry includes `timestamp` (ISO 8601), `request_id` (from Rails' `X-Req
 
 | Event | Level | Fields | When |
 |---|---|---|---|
-| `cache_hit` | info | `request_id`, `period`, `hotel`, `room` | Fresh rate served from cache — no upstream call |
-| `cache_miss` | info | `request_id`, `period`, `hotel`, `room` | Cache empty or stale — upstream call will follow |
+| `cache_hit` | info | + `duration_ms` | Fresh rate served from cache — `duration_ms` is SQLite read time |
+| `cache_miss` | info | + `duration_ms` | Cache empty or stale and upstream API will be called — `duration_ms` is SQLite read time. Note: if a thread was waiting for a lock and finds the cache already refreshed by another thread, it logs `cache_hit` instead — `cache_miss` is only logged when an upstream call actually follows |
 | `upstream_api_call` | info | + `duration_ms` | Every upstream API call with response time |
 | `cache_store` | info | + `duration_ms` | Rate successfully stored in cache — `duration_ms` is SQLite write time |
 | `upstream_rate_limit` | warn | + `body` | HTTP 429 received — daily quota exhausted |

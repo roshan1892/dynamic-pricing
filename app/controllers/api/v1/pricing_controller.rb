@@ -1,4 +1,6 @@
 class Api::V1::PricingController < ApplicationController
+  include StructuredLogging
+
   VALID_PERIODS = %w[Summer Autumn Winter Spring].freeze
   VALID_HOTELS = %w[FloatingPointResort GitawayHotel RecursionRetreat].freeze
   VALID_ROOMS = %w[SingletonRoom BooleanTwin RestfulKing].freeze
@@ -18,7 +20,7 @@ class Api::V1::PricingController < ApplicationController
       render json: service.errors.first, status: :service_unavailable
     end
   rescue StandardError => e
-    Rails.logger.error({ timestamp: Time.current.utc.iso8601(3), request_id: Thread.current[:request_id], event: 'unexpected_error', message: e.message, backtrace: e.backtrace&.first }.to_json)
+    log_event(:error, event: 'unexpected_error', message: e.message, backtrace: e.backtrace&.first)
     render json: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred. Please try again.' }, status: :internal_server_error
   end
 

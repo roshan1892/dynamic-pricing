@@ -26,6 +26,10 @@ RUN apk add --no-cache \
 COPY Gemfile Gemfile.lock /rails/
 RUN bundle install --gemfile=/rails/Gemfile
 
+# Fix Windows CRLF line endings in executable scripts — no-op on Mac/Linux
+COPY bin/ /rails/bin/
+RUN sed -i 's/\r$//' bin/* && chmod +x bin/*
+
 # Start the server by default, this can be overwritten at runtime
 EXPOSE 3000
 CMD ["sh", "-c", "./bin/rails db:prepare && ./bin/rails server -b 0.0.0.0"]
